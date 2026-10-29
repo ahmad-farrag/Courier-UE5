@@ -1,0 +1,4 @@
+* text=auto
+*.png binary
+*.uasset binary
+*.h linguist-language=C++

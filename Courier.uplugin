@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Courier",
+	"Description": "A Postman-style API client inside the editor (HTTP, GraphQL, WebSocket, Server-Sent Events, collections, environments, Postman import/export) and a Blueprint/C++ API with async nodes and delegates.",
+	"Category": "Networking",
+	"CreatedBy": "Ahmed Farrag",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "Courier",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "CourierEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
