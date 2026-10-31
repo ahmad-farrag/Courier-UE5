@@ -75,7 +75,7 @@ Courier is one plugin with three modules. Nothing else to install: it uses the e
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/blueprint-socketio.png" alt="Blueprint: BeginPlay, Create Courier Socket IO, set MatchSocket, Bind Event to On Event, Connect; OnMatchEvent emits kick with ack and prints the arguments"></td>
+    <td width="50%"><img src="docs/images/blueprint-socketio.png" alt="Blueprint: BeginPlay, Create Courier Socket IO, set MatchSocket, Bind Event to On Event, Connect; OnMatchEvent prints the arguments, then emits kick with ack"></td>
     <td width="50%"><img src="docs/images/socketio-console.png" alt="The Courier window with a Socket.IO request connected to /match"></td>
   </tr>
   <tr>
