@@ -12,7 +12,8 @@ public class CourierEditor : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"BlueprintGraph",
-			"Courier"
+			"Courier",
+			"CourierBlueprint"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]

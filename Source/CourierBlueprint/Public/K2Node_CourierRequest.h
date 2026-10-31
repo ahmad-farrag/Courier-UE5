@@ -12,7 +12,7 @@ class UCourierRequestAsset;
  * On Failure with the response, like the other Courier nodes.
  */
 UCLASS()
-class COURIEREDITOR_API UK2Node_CourierRequest : public UK2Node_BaseAsyncTask
+class COURIERBLUEPRINT_API UK2Node_CourierRequest : public UK2Node_BaseAsyncTask
 {
 	GENERATED_BODY()
 

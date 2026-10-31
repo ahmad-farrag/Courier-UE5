@@ -6,10 +6,10 @@
 	"Description": "A Postman-style API client inside the editor (HTTP, GraphQL, WebSocket, Server-Sent Events, collections, environments, Postman import/export) and a Blueprint/C++ API with async nodes and delegates.",
 	"Category": "Networking",
 	"CreatedBy": "Ahmed Farrag",
-	"CreatedByURL": "",
-	"DocsURL": "",
+	"CreatedByURL": "https://github.com/ahmad-farrag",
+	"DocsURL": "https://github.com/ahmad-farrag/Courier#readme",
 	"MarketplaceURL": "",
-	"SupportURL": "",
+	"SupportURL": "https://github.com/ahmad-farrag/Courier/issues",
 	"EnabledByDefault": false,
 	"CanContainContent": false,
 	"IsBetaVersion": true,
@@ -19,6 +19,11 @@
 		{
 			"Name": "Courier",
 			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "CourierBlueprint",
+			"Type": "UncookedOnly",
 			"LoadingPhase": "Default"
 		},
 		{

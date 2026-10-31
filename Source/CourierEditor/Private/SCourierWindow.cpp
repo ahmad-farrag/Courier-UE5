@@ -1871,10 +1871,10 @@ TSharedRef<ITableRow> SCourierWindow::OnGenerateLogRow(FLogLinePtr Line, const T
 	FSlateColor Color = FSlateColor::UseForeground();
 	switch (Line->Kind)
 	{
-	case FLogLine::EKind::Sent:		Glyph = TEXT("â†‘"); Color = FLinearColor(1.f, 0.8f, 0.3f); break;
-	case FLogLine::EKind::Received:	Glyph = TEXT("â†“"); Color = FLinearColor(0.42f, 0.83f, 0.47f); break;
+	case FLogLine::EKind::Sent:		Glyph = TEXT("↑"); Color = FLinearColor(1.f, 0.8f, 0.3f); break;
+	case FLogLine::EKind::Received:	Glyph = TEXT("↓"); Color = FLinearColor(0.42f, 0.83f, 0.47f); break;
 	case FLogLine::EKind::Error:	Glyph = TEXT("!"); Color = FLinearColor(1.f, 0.42f, 0.4f); break;
-	default:						Glyph = TEXT("â€¢"); Color = CourierWindow::Subdued; break;
+	default:						Glyph = TEXT("•"); Color = CourierWindow::Subdued; break;
 	}
 	return SNew(STableRow<FLogLinePtr>, Owner)
 		.Padding(FMargin(4, 2))
@@ -1894,7 +1894,9 @@ TSharedRef<ITableRow> SCourierWindow::OnGenerateLogRow(FLogLinePtr Line, const T
 				.Visibility(Line->Tag.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
 				.Font(FAppStyle::GetFontStyle("SmallFontBold"))
 				.ColorAndOpacity(FLinearColor(0.95f, 0.55f, 0.85f))
-				.Text(FText::FromString(Line->Tag))
+				// SSE ids can be long JSON (Wikimedia's are); the full tag is in the tooltip.
+				.Text(FText::FromString(Line->Tag.Len() > 40 ? Line->Tag.Left(39) + TEXT("…") : Line->Tag))
+				.ToolTipText(FText::FromString(Line->Tag))
 			]
 			+ SHorizontalBox::Slot().FillWidth(1.f)
 			[
