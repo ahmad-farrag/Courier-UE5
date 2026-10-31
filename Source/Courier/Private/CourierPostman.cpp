@@ -145,6 +145,47 @@ namespace CourierPostman
 			Out.ApiKeyValue = AuthParam(Auth, TEXT("apikey"), TEXT("value"));
 			Out.bApiKeyInQuery = AuthParam(Auth, TEXT("apikey"), TEXT("in")).Equals(TEXT("query"), ESearchCase::IgnoreCase);
 		}
+		else if (Type == TEXT("oauth2"))
+		{
+			Out.Type = ECourierAuthType::OAuth2;
+			FCourierOAuth2& OAuth2 = Out.OAuth2;
+			const FString Grant = AuthParam(Auth, TEXT("oauth2"), TEXT("grant_type"));
+			if (Grant == TEXT("password_credentials"))
+			{
+				OAuth2.GrantType = ECourierOAuth2Grant::Password;
+			}
+			else if (Grant.StartsWith(TEXT("authorization_code")) || Grant == TEXT("implicit"))
+			{
+				// Implicit is deprecated (OAuth 2.1); Authorization Code with PKCE replaces it.
+				OAuth2.GrantType = ECourierOAuth2Grant::AuthorizationCode;
+				OAuth2.bUsePkce = Grant != TEXT("authorization_code");
+			}
+			else
+			{
+				OAuth2.GrantType = ECourierOAuth2Grant::ClientCredentials;
+			}
+			OAuth2.AccessTokenUrl = AuthParam(Auth, TEXT("oauth2"), TEXT("accessTokenUrl"));
+			OAuth2.AuthUrl = AuthParam(Auth, TEXT("oauth2"), TEXT("authUrl"));
+			OAuth2.ClientId = AuthParam(Auth, TEXT("oauth2"), TEXT("clientId"));
+			OAuth2.ClientSecret = AuthParam(Auth, TEXT("oauth2"), TEXT("clientSecret"));
+			OAuth2.Scope = AuthParam(Auth, TEXT("oauth2"), TEXT("scope"));
+			OAuth2.Audience = AuthParam(Auth, TEXT("oauth2"), TEXT("audience"));
+			OAuth2.Username = AuthParam(Auth, TEXT("oauth2"), TEXT("username"));
+			OAuth2.Password = AuthParam(Auth, TEXT("oauth2"), TEXT("password"));
+			OAuth2.AccessToken = AuthParam(Auth, TEXT("oauth2"), TEXT("accessToken"));
+			const FString Redirect = AuthParam(Auth, TEXT("oauth2"), TEXT("redirect_uri"));
+			if (!Redirect.IsEmpty())
+			{
+				OAuth2.RedirectUri = Redirect;
+			}
+			const FString Prefix = AuthParam(Auth, TEXT("oauth2"), TEXT("headerPrefix"));
+			if (!Prefix.IsEmpty())
+			{
+				OAuth2.HeaderPrefix = Prefix;
+			}
+			OAuth2.ClientAuthentication = AuthParam(Auth, TEXT("oauth2"), TEXT("client_authentication")) == TEXT("body")
+				? ECourierOAuth2ClientAuth::Body : ECourierOAuth2ClientAuth::BasicHeader;
+		}
 		else if (Type != TEXT("noauth"))
 		{
 			UE_LOG(LogCourier, Warning, TEXT("Courier: Postman auth type '%s' is not supported; the request is imported without auth."), *Type);
@@ -312,6 +353,18 @@ namespace CourierPostman
 			{
 				Spec.Protocol = ECourierProtocol::ServerSentEvents;
 			}
+			else if (Protocol == TEXT("SocketIO"))
+			{
+				Spec.Protocol = ECourierProtocol::SocketIO;
+				const FString Namespace = GetString(Extension, TEXT("namespace"));
+				Spec.SocketIONamespace = Namespace.IsEmpty() ? FString(TEXT("/")) : Namespace;
+				Spec.SocketIOAuth = GetString(Extension, TEXT("auth"));
+			}
+			bool bCookies = true;
+			if (Extension->TryGetBoolField(TEXT("cookies"), bCookies))
+			{
+				Spec.bUseCookieJar = bCookies;
+			}
 			if (const TArray<TSharedPtr<FJsonValue>>* Protocols = GetArray(Extension, TEXT("protocols")))
 			{
 				for (const TSharedPtr<FJsonValue>& Entry : *Protocols)
@@ -408,6 +461,29 @@ namespace CourierPostman
 			Object->SetStringField(TEXT("type"), TEXT("apikey"));
 			Object->SetArrayField(TEXT("apikey"), { AuthEntry(TEXT("key"), Auth.ApiKeyName), AuthEntry(TEXT("value"), Auth.ApiKeyValue), AuthEntry(TEXT("in"), Auth.bApiKeyInQuery ? TEXT("query") : TEXT("header")) });
 			break;
+		case ECourierAuthType::OAuth2:
+		{
+			const FCourierOAuth2& OAuth2 = Auth.OAuth2;
+			const TCHAR* Grant = OAuth2.GrantType == ECourierOAuth2Grant::Password ? TEXT("password_credentials")
+				: OAuth2.GrantType == ECourierOAuth2Grant::AuthorizationCode ? (OAuth2.bUsePkce ? TEXT("authorization_code_with_pkce") : TEXT("authorization_code"))
+				: TEXT("client_credentials");
+			Object->SetStringField(TEXT("type"), TEXT("oauth2"));
+			Object->SetArrayField(TEXT("oauth2"), {
+				AuthEntry(TEXT("grant_type"), Grant),
+				AuthEntry(TEXT("accessTokenUrl"), OAuth2.AccessTokenUrl),
+				AuthEntry(TEXT("authUrl"), OAuth2.AuthUrl),
+				AuthEntry(TEXT("clientId"), OAuth2.ClientId),
+				AuthEntry(TEXT("clientSecret"), OAuth2.ClientSecret),
+				AuthEntry(TEXT("scope"), OAuth2.Scope),
+				AuthEntry(TEXT("audience"), OAuth2.Audience),
+				AuthEntry(TEXT("username"), OAuth2.Username),
+				AuthEntry(TEXT("password"), OAuth2.Password),
+				AuthEntry(TEXT("redirect_uri"), OAuth2.RedirectUri),
+				AuthEntry(TEXT("headerPrefix"), OAuth2.HeaderPrefix),
+				AuthEntry(TEXT("client_authentication"), OAuth2.ClientAuthentication == ECourierOAuth2ClientAuth::Body ? TEXT("body") : TEXT("header")),
+				AuthEntry(TEXT("addTokenTo"), TEXT("header")) });
+			break;
+		}
 		default:
 			Object->SetStringField(TEXT("type"), TEXT("noauth"));
 			break;
@@ -570,7 +646,18 @@ namespace CourierPostman
 
 		TSharedRef<FJsonObject> Extension = MakeShared<FJsonObject>();
 		Extension->SetStringField(TEXT("protocol"),
-			Spec.Protocol == ECourierProtocol::WebSocket ? TEXT("WebSocket") : Spec.Protocol == ECourierProtocol::ServerSentEvents ? TEXT("ServerSentEvents") : TEXT("Http"));
+			Spec.Protocol == ECourierProtocol::WebSocket ? TEXT("WebSocket")
+			: Spec.Protocol == ECourierProtocol::ServerSentEvents ? TEXT("ServerSentEvents")
+			: Spec.Protocol == ECourierProtocol::SocketIO ? TEXT("SocketIO") : TEXT("Http"));
+		if (Spec.Protocol == ECourierProtocol::SocketIO)
+		{
+			Extension->SetStringField(TEXT("namespace"), Spec.SocketIONamespace);
+			Extension->SetStringField(TEXT("auth"), Spec.SocketIOAuth);
+		}
+		if (!Spec.bUseCookieJar)
+		{
+			Extension->SetBoolField(TEXT("cookies"), false);
+		}
 		if (Spec.WebSocketProtocols.Num() > 0)
 		{
 			TArray<TSharedPtr<FJsonValue>> Protocols;

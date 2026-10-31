@@ -1,13 +1,17 @@
 #include "SCourierWindow.h"
 
 #include "AssetToolsModule.h"
+#include "Async/Async.h"
 #include "BlueprintActionDatabase.h"
+#include "CourierCookies.h"
 #include "CourierEventSource.h"
 #include "CourierHttp.h"
 #include "CourierLibrary.h"
+#include "CourierOAuth2.h"
 #include "CourierPostman.h"
 #include "CourierRequestAsset.h"
 #include "CourierRequestAssetFactory.h"
+#include "CourierSocketIO.h"
 #include "CourierWebSocket.h"
 #include "CourierWorkspace.h"
 #include "FileHelpers.h"
@@ -57,6 +61,7 @@ namespace CourierWindow
 		{
 		case ECourierProtocol::WebSocket:			return LOCTEXT("ProtoWs", "WebSocket");
 		case ECourierProtocol::ServerSentEvents:	return LOCTEXT("ProtoSse", "Server-Sent Events");
+		case ECourierProtocol::SocketIO:			return LOCTEXT("ProtoSio", "Socket.IO");
 		default:									return LOCTEXT("ProtoHttp", "HTTP");
 		}
 	}
@@ -97,6 +102,32 @@ namespace CourierWindow
 		return SNew(STextBlock).Text(Text).ColorAndOpacity(Subdued).Font(FAppStyle::GetFontStyle("SmallFontBold"));
 	}
 
+	/** Protocols with no request body: messages go through the console instead. */
+	bool HasNoBody(ECourierProtocol Protocol)
+	{
+		return Protocol == ECourierProtocol::WebSocket || Protocol == ECourierProtocol::SocketIO;
+	}
+
+	FText DescribeExpiry(const FDateTime& ExpiresAt)
+	{
+		if (ExpiresAt.GetTicks() == 0)
+		{
+			return LOCTEXT("NoExpiry", "no expiry given");
+		}
+		const FTimespan Left = ExpiresAt - FDateTime::UtcNow();
+		if (Left.GetTotalSeconds() <= 0)
+		{
+			return LOCTEXT("Expired", "expired");
+		}
+		if (Left.GetTotalDays() >= 2.0)
+		{
+			return FText::Format(LOCTEXT("ExpiresDays", "expires in {0} days"), FText::AsNumber(FMath::FloorToInt(Left.GetTotalDays())));
+		}
+		return Left.GetTotalMinutes() >= 1.0
+			? FText::Format(LOCTEXT("ExpiresMinutes", "expires in {0} min"), FText::AsNumber(FMath::FloorToInt(Left.GetTotalMinutes())))
+			: FText::Format(LOCTEXT("ExpiresSeconds", "expires in {0} s"), FText::AsNumber(FMath::FloorToInt(Left.GetTotalSeconds())));
+	}
+
 	/** A folder path is inside (or is) another. */
 	bool IsInFolder(const FString& Folder, const FString& Parent)
 	{
@@ -118,6 +149,18 @@ void SCourierWindow::Construct(const FArguments& InArgs)
 {
 	FCourierWorkspace& Workspace = FCourierWorkspace::Get();
 	WorkspaceChangedHandle = Workspace.OnChanged.AddSP(this, &SCourierWindow::OnWorkspaceChanged);
+	// The jar can change on the HTTP thread; refresh the list on the game thread.
+	TWeakPtr<SCourierWindow> WeakWindow = SharedThis(this);
+	CookiesChangedHandle = FCourierCookieJar::Get().OnChanged.AddLambda([WeakWindow]()
+	{
+		AsyncTask(ENamedThreads::GameThread, [WeakWindow]()
+		{
+			if (const TSharedPtr<SCourierWindow> Self = WeakWindow.Pin())
+			{
+				Self->RefreshCookies();
+			}
+		});
+	});
 	for (const FCourierCollection& Collection : Workspace.Data.Collections)
 	{
 		ExpandedKeys.Add(TEXT("C:") + Collection.Id.ToString());
@@ -159,6 +202,7 @@ void SCourierWindow::Construct(const FArguments& InArgs)
 
 	RefreshTree();
 	RefreshHistory();
+	RefreshCookies();
 	RebuildEnvironments();
 	ShowRequestEditor();
 }
@@ -166,6 +210,7 @@ void SCourierWindow::Construct(const FArguments& InArgs)
 SCourierWindow::~SCourierWindow()
 {
 	FCourierWorkspace::Get().OnChanged.Remove(WorkspaceChangedHandle);
+	FCourierCookieJar::Get().OnChanged.Remove(CookiesChangedHandle);
 	if (InFlight.IsValid())
 	{
 		InFlight->OnProcessRequestComplete().Unbind();
@@ -178,14 +223,7 @@ FReply SCourierWindow::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& I
 {
 	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::Enter)
 	{
-		if (Working->Protocol == ECourierProtocol::Http)
-		{
-			SendHttp();
-		}
-		else
-		{
-			ToggleStream();
-		}
+		SendOrConnect();
 		return FReply::Handled();
 	}
 	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::S)
@@ -268,6 +306,8 @@ TSharedRef<SWidget> SCourierWindow::MakeNewMenu()
 		FUIAction(FExecuteAction::CreateLambda([this]() { NewRequest(ECourierProtocol::WebSocket); })));
 	Menu.AddMenuEntry(LOCTEXT("NewSse", "Server-Sent Events"), LOCTEXT("NewSseTip", "A text/event-stream subscription"), FSlateIcon(),
 		FUIAction(FExecuteAction::CreateLambda([this]() { NewRequest(ECourierProtocol::ServerSentEvents); })));
+	Menu.AddMenuEntry(LOCTEXT("NewSio", "Socket.IO"), LOCTEXT("NewSioTip", "A Socket.IO v3/v4 connection: emit and receive named events"), FSlateIcon(),
+		FUIAction(FExecuteAction::CreateLambda([this]() { NewRequest(ECourierProtocol::SocketIO); })));
 	Menu.AddSeparator();
 	Menu.AddMenuEntry(LOCTEXT("NewCollection", "Collection"), FText::GetEmpty(), FSlateIcon(),
 		FUIAction(FExecuteAction::CreateLambda([this]()
@@ -367,6 +407,7 @@ TSharedRef<SWidget> SCourierWindow::BuildSidebar()
 			+ SSegmentedControl<int32>::Slot(0).Text(LOCTEXT("TabCollections", "Collections"))
 			+ SSegmentedControl<int32>::Slot(1).Text(LOCTEXT("TabEnvironments", "Environments"))
 			+ SSegmentedControl<int32>::Slot(2).Text(LOCTEXT("TabHistory", "History"))
+			+ SSegmentedControl<int32>::Slot(3).Text(LOCTEXT("TabCookies", "Cookies"))
 		]
 		+ SVerticalBox::Slot().FillHeight(1.f)
 		[
@@ -375,6 +416,7 @@ TSharedRef<SWidget> SCourierWindow::BuildSidebar()
 			+ SWidgetSwitcher::Slot()[Collections]
 			+ SWidgetSwitcher::Slot()[SAssignNew(EnvironmentsHost, SBox)]
 			+ SWidgetSwitcher::Slot()[History]
+			+ SWidgetSwitcher::Slot()[BuildCookiesPanel()]
 		];
 }
 
@@ -591,6 +633,8 @@ TSharedPtr<SWidget> SCourierWindow::OnTreeContextMenu()
 			FUIAction(FExecuteAction::CreateLambda([this, CollectionId, Folder]() { NewRequest(ECourierProtocol::WebSocket, ECourierBodyType::None, CollectionId, Folder); })));
 		Menu.AddMenuEntry(LOCTEXT("CtxNewSse", "New Server-Sent Events"), FText::GetEmpty(), FSlateIcon(),
 			FUIAction(FExecuteAction::CreateLambda([this, CollectionId, Folder]() { NewRequest(ECourierProtocol::ServerSentEvents, ECourierBodyType::None, CollectionId, Folder); })));
+		Menu.AddMenuEntry(LOCTEXT("CtxNewSio", "New Socket.IO"), FText::GetEmpty(), FSlateIcon(),
+			FUIAction(FExecuteAction::CreateLambda([this, CollectionId, Folder]() { NewRequest(ECourierProtocol::SocketIO, ECourierBodyType::None, CollectionId, Folder); })));
 		Menu.AddMenuEntry(LOCTEXT("CtxNewFolder", "New Folder"), FText::GetEmpty(), FSlateIcon(),
 			FUIAction(FExecuteAction::CreateLambda([this, CollectionId, Folder]()
 			{
@@ -1017,7 +1061,7 @@ void SCourierWindow::ShowRequestEditor()
 TSharedRef<SWidget> SCourierWindow::BuildRequestEditor()
 {
 	const bool bHttp = Working->Protocol == ECourierProtocol::Http;
-	const bool bShowVerb = Working->Protocol != ECourierProtocol::WebSocket;
+	const bool bShowVerb = Working->Protocol == ECourierProtocol::Http || Working->Protocol == ECourierProtocol::ServerSentEvents;
 
 	TSharedRef<SHorizontalBox> UrlRow = SNew(SHorizontalBox);
 	if (bShowVerb)
@@ -1042,7 +1086,9 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestEditor()
 	[
 		SNew(SEditableTextBox)
 		.Font(CourierUI::MonoFont(10))
-		.HintText(Working->Protocol == ECourierProtocol::WebSocket ? LOCTEXT("WsUrlHint", "wss://example.com/socket") : LOCTEXT("UrlHint", "https://api.example.com/users/{{id}}"))
+		.HintText(Working->Protocol == ECourierProtocol::WebSocket ? LOCTEXT("WsUrlHint", "wss://example.com/socket")
+			: Working->Protocol == ECourierProtocol::SocketIO ? LOCTEXT("SioUrlHint", "https://example.com  (the Socket.IO server; /socket.io/ is added)")
+			: LOCTEXT("UrlHint", "https://api.example.com/users/{{id}}"))
 		.Text(FText::FromString(Working->Url))
 		.OnTextChanged_Lambda([this](const FText& Text) { Working->Url = Text.ToString(); MarkDirty(); })
 		.OnTextCommitted_Lambda([this](const FText& Text, ETextCommit::Type Commit)
@@ -1061,7 +1107,7 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestEditor()
 				Working->QueryParams.Append(Query);
 				ShowRequestEditor();
 			}
-			Working->Protocol == ECourierProtocol::Http ? SendHttp() : ToggleStream();
+			SendOrConnect();
 		})
 	];
 	UrlRow->AddSlot().AutoWidth()
@@ -1075,7 +1121,7 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestEditor()
 			.ToolTipText(LOCTEXT("SendTip", "Ctrl+Enter"))
 			.OnClicked_Lambda([this]()
 			{
-				Working->Protocol == ECourierProtocol::Http ? SendHttp() : ToggleStream();
+				SendOrConnect();
 				return FReply::Handled();
 			})
 		]
@@ -1177,6 +1223,7 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestEditor()
 TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 {
 	const bool bWebSocket = Working->Protocol == ECourierProtocol::WebSocket;
+	const bool bSocketIO = Working->Protocol == ECourierProtocol::SocketIO;
 	const FSimpleDelegate Dirty = FSimpleDelegate::CreateSP(this, &SCourierWindow::MarkDirty);
 
 	TSharedRef<SWidget> Params = SNew(SScrollBox)
@@ -1198,8 +1245,10 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 			.Text(LOCTEXT("AutoHeaders", "Content-Type comes from the body type and Authorization from the Auth tab unless you set them here."))
 		];
 
-	TSharedRef<SWidget> Body = bWebSocket
-		? StaticCastSharedRef<SWidget>(SNew(STextBlock).ColorAndOpacity(CourierWindow::Subdued).Text(LOCTEXT("WsBody", "A WebSocket has no request body: write messages in the console below once connected.")))
+	TSharedRef<SWidget> Body = CourierWindow::HasNoBody(Working->Protocol)
+		? StaticCastSharedRef<SWidget>(SNew(STextBlock).AutoWrapText(true).ColorAndOpacity(CourierWindow::Subdued).Text(bSocketIO
+			? LOCTEXT("SioBody", "Socket.IO has no request body: emit events from the console below once connected. The CONNECT auth payload is in Settings.")
+			: LOCTEXT("WsBody", "A WebSocket has no request body: write messages in the console below once connected.")))
 		: StaticCastSharedRef<SWidget>(SNew(SVerticalBox)
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4).HAlign(HAlign_Left)
 			[
@@ -1215,8 +1264,9 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 				SAssignNew(BodyHost, SBox)
 			]);
 
-	TSharedRef<SWidget> Auth = SNew(SVerticalBox)
-		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6).HAlign(HAlign_Left)
+	// OAuth 2.0 has many fields: scroll rather than spill over the response pane.
+	TSharedRef<SWidget> Auth = SNew(SScrollBox)
+		+ SScrollBox::Slot().Padding(0, 0, 0, 6).HAlign(HAlign_Left)
 		[
 			SNew(SComboButton)
 			.OnGetMenuContent(this, &SCourierWindow::MakeAuthTypeMenu)
@@ -1225,7 +1275,7 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 				SNew(STextBlock).Text_Lambda([this]() { return CourierWindow::AuthTypeName(Working->Auth.Type); })
 			]
 		]
-		+ SVerticalBox::Slot().AutoHeight()
+		+ SScrollBox::Slot()
 		[
 			SAssignNew(AuthHost, SBox)
 		];
@@ -1284,16 +1334,63 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 			]
 		];
 	}
+	if (bSocketIO)
+	{
+		Settings->AddSlot().AutoHeight().Padding(0, 0, 0, 6)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			[
+				SNew(SBox).WidthOverride(110.f)[SNew(STextBlock).Text(LOCTEXT("SioNamespace", "Namespace"))]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.f)
+			[
+				SNew(SEditableTextBox)
+				.Font(CourierUI::MonoFont())
+				.HintText(LOCTEXT("SioNamespaceHint", "/ (default) or /match"))
+				.Text(FText::FromString(Working->SocketIONamespace))
+				.OnTextChanged_Lambda([this](const FText& Text) { Working->SocketIONamespace = Text.ToString(); MarkDirty(); })
+			]
+		];
+		Settings->AddSlot().AutoHeight().Padding(0, 0, 0, 2)
+		[
+			CourierWindow::SectionLabel(LOCTEXT("SioAuth", "AUTH PAYLOAD (JSON, sent with CONNECT; the server reads socket.handshake.auth)"))
+		];
+		Settings->AddSlot().AutoHeight().Padding(0, 0, 0, 6)
+		[
+			SNew(SBox).MinDesiredHeight(48.f)
+			[
+				SNew(SMultiLineEditableTextBox)
+				.Font(CourierUI::MonoFont(9))
+				.HintText(LOCTEXT("SioAuthHint", "{ \"token\": \"{{token}}\" }"))
+				.Text(FText::FromString(Working->SocketIOAuth))
+				.OnTextChanged_Lambda([this](const FText& Text) { Working->SocketIOAuth = Text.ToString(); MarkDirty(); })
+			]
+		];
+	}
+	Settings->AddSlot().AutoHeight().Padding(0, 0, 0, 6)
+	[
+		SNew(SCheckBox)
+		.IsChecked_Lambda([this]() { return Working->bUseCookieJar ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+		.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { Working->bUseCookieJar = State == ECheckBoxState::Checked; MarkDirty(); })
+		.ToolTipText(LOCTEXT("CookieJarTip", "Send matching cookies from the jar (sidebar > Cookies) and keep the ones the server sets."))
+		[
+			SNew(STextBlock).Text(LOCTEXT("UseCookieJar", "Send and store cookies"))
+		]
+	];
 	Settings->AddSlot().AutoHeight().Padding(0, 0, 0, 2)
 	[
 		CourierWindow::SectionLabel(LOCTEXT("Description", "DESCRIPTION"))
 	];
-	Settings->AddSlot().FillHeight(1.f)
+	Settings->AddSlot().AutoHeight()
 	[
-		SNew(SMultiLineEditableTextBox)
-		.Text(FText::FromString(Working->Description))
-		.AutoWrapText(true)
-		.OnTextChanged_Lambda([this](const FText& Text) { Working->Description = Text.ToString(); MarkDirty(); })
+		SNew(SBox).MinDesiredHeight(80.f)
+		[
+			SNew(SMultiLineEditableTextBox)
+			.Text(FText::FromString(Working->Description))
+			.AutoWrapText(true)
+			.OnTextChanged_Lambda([this](const FText& Text) { Working->Description = Text.ToString(); MarkDirty(); })
+		]
 	];
 
 	return SNew(SVerticalBox)
@@ -1316,7 +1413,7 @@ TSharedRef<SWidget> SCourierWindow::BuildRequestTabs()
 			+ SWidgetSwitcher::Slot()[Headers]
 			+ SWidgetSwitcher::Slot()[Body]
 			+ SWidgetSwitcher::Slot()[Auth]
-			+ SWidgetSwitcher::Slot()[Settings]
+			+ SWidgetSwitcher::Slot()[SNew(SScrollBox) + SScrollBox::Slot()[Settings]]
 		];
 }
 
@@ -1344,7 +1441,7 @@ TSharedRef<SWidget> SCourierWindow::MakeVerbMenu()
 TSharedRef<SWidget> SCourierWindow::MakeProtocolMenu()
 {
 	FMenuBuilder Menu(true, nullptr);
-	for (ECourierProtocol Protocol : { ECourierProtocol::Http, ECourierProtocol::WebSocket, ECourierProtocol::ServerSentEvents })
+	for (ECourierProtocol Protocol : { ECourierProtocol::Http, ECourierProtocol::WebSocket, ECourierProtocol::ServerSentEvents, ECourierProtocol::SocketIO })
 	{
 		Menu.AddMenuEntry(CourierWindow::ProtocolName(Protocol), FText::GetEmpty(), FSlateIcon(),
 			FUIAction(FExecuteAction::CreateLambda([this, Protocol]()
@@ -1392,7 +1489,7 @@ TSharedRef<SWidget> SCourierWindow::MakeBodyTypeMenu()
 TSharedRef<SWidget> SCourierWindow::MakeAuthTypeMenu()
 {
 	FMenuBuilder Menu(true, nullptr);
-	for (ECourierAuthType Type : { ECourierAuthType::None, ECourierAuthType::Bearer, ECourierAuthType::Basic, ECourierAuthType::ApiKey })
+	for (ECourierAuthType Type : { ECourierAuthType::None, ECourierAuthType::Bearer, ECourierAuthType::Basic, ECourierAuthType::ApiKey, ECourierAuthType::OAuth2 })
 	{
 		Menu.AddMenuEntry(CourierWindow::AuthTypeName(Type), FText::GetEmpty(), FSlateIcon(),
 			FUIAction(FExecuteAction::CreateLambda([this, Type]() { Working->Auth.Type = Type; MarkDirty(); RebuildAuth(); })));
@@ -1610,6 +1707,9 @@ void SCourierWindow::RebuildAuth()
 			]
 		];
 		break;
+	case ECourierAuthType::OAuth2:
+		BuildOAuth2Panel(Box);
+		break;
 	default:
 		Box->AddSlot().AutoHeight()
 		[
@@ -1779,6 +1879,7 @@ void SCourierWindow::RebuildResponseHeaders()
 TSharedRef<SWidget> SCourierWindow::BuildStreamPanel()
 {
 	const bool bWebSocket = Working->Protocol == ECourierProtocol::WebSocket;
+	const bool bSocketIO = Working->Protocol == ECourierProtocol::SocketIO;
 	TSharedRef<SVerticalBox> Panel = SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
 		[
@@ -1829,6 +1930,60 @@ TSharedRef<SWidget> SCourierWindow::BuildStreamPanel()
 			]
 		];
 
+	if (bSocketIO)
+	{
+		Panel->AddSlot().AutoHeight().Padding(0, 6, 0, 0)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Top).Padding(0, 0, 4, 0)
+			[
+				SNew(SBox).WidthOverride(150.f)
+				[
+					SNew(SEditableTextBox)
+					.Font(CourierUI::MonoFont(9))
+					.HintText(LOCTEXT("SioEventHint", "event name"))
+					.Text(FText::FromString(ComposerEvent))
+					.OnTextChanged_Lambda([this](const FText& Text) { ComposerEvent = Text.ToString(); })
+				]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.f).Padding(0, 0, 4, 0)
+			[
+				SNew(SBox).MaxDesiredHeight(120.f)
+				[
+					SAssignNew(Composer, SMultiLineEditableTextBox)
+					.Font(CourierUI::MonoFont(9))
+					.HintText(LOCTEXT("SioComposerHint", "Data: JSON (sent as is) or text (sent as a string). Ctrl+Enter emits; {{variables}} are filled."))
+					.OnKeyDownHandler_Lambda([this](const FGeometry&, const FKeyEvent& Key)
+					{
+						if (Key.GetKey() == EKeys::Enter && Key.IsControlDown())
+						{
+							EmitSocketIOEvent();
+							return FReply::Handled();
+						}
+						return FReply::Unhandled();
+					})
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Bottom).Padding(0, 0, 6, 4)
+			[
+				SNew(SCheckBox)
+				.IsChecked_Lambda([this]() { return bComposerAck ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bComposerAck = State == ECheckBoxState::Checked; })
+				.ToolTipText(LOCTEXT("SioAckTip", "Ask the server to acknowledge; its reply shows as an ack line."))
+				[
+					SNew(STextBlock).Text(LOCTEXT("SioAck", "Ack"))
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Bottom)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
+				.Text(LOCTEXT("SioEmit", "Emit"))
+				.IsEnabled_Lambda([this]() { return IsStreamOpen(); })
+				.OnClicked_Lambda([this]() { EmitSocketIOEvent(); return FReply::Handled(); })
+			]
+		];
+	}
 	if (bWebSocket)
 	{
 		Panel->AddSlot().AutoHeight().Padding(0, 6, 0, 0)
@@ -1931,7 +2086,7 @@ void SCourierWindow::AddLog(FLogLine::EKind Kind, const FString& Text, const FSt
 
 bool SCourierWindow::IsStreamOpen() const
 {
-	return (Socket.IsValid() && Socket->IsConnected()) || (Sse.IsValid() && Sse->IsOpen());
+	return (Socket.IsValid() && Socket->IsConnected()) || (Sse.IsValid() && Sse->IsOpen()) || (SocketIO.IsValid() && SocketIO->IsConnected());
 }
 
 void SCourierWindow::ToggleStream()
@@ -1941,7 +2096,12 @@ void SCourierWindow::ToggleStream()
 		CloseStreams();
 		return;
 	}
-	Working->Protocol == ECourierProtocol::WebSocket ? ConnectWebSocket() : ConnectSse();
+	switch (Working->Protocol)
+	{
+	case ECourierProtocol::WebSocket:	ConnectWebSocket(); break;
+	case ECourierProtocol::SocketIO:	ConnectSocketIO(); break;
+	default:							ConnectSse(); break;
+	}
 }
 
 void SCourierWindow::ConnectWebSocket()
@@ -2070,6 +2230,11 @@ void SCourierWindow::CloseStreams()
 	{
 		Sse->Close();
 	}
+	if (SocketIO.IsValid())
+	{
+		SocketIO->Disconnect();
+		SocketIO.Reset();
+	}
 }
 
 void SCourierWindow::SendWebSocketMessage()
@@ -2085,6 +2250,367 @@ void SCourierWindow::SendWebSocketMessage()
 	}
 	Socket->Send(Message);
 	AddLog(FLogLine::EKind::Sent, Message);
+}
+
+void SCourierWindow::ConnectSocketIO()
+{
+	FCourierRequestSpec Spec = *Working;
+	Spec.BodyType = ECourierBodyType::None;
+	FCourierPreparedRequest Prepared;
+	FString Error;
+	const TMap<FString, FString> Variables = GetVariables();
+	if (!FCourierHttp::Prepare(Spec, Variables, Prepared, Error))
+	{
+		AddLog(FLogLine::EKind::Error, Error);
+		return;
+	}
+	TMap<FString, FString> Headers;
+	for (const TPair<FString, FString>& Header : Prepared.Headers)
+	{
+		Headers.Add(Header.Key, Header.Value);
+	}
+	FString Namespace = FCourierHttp::ResolveVariables(Working->SocketIONamespace, Variables).TrimStartAndEnd();
+	if (Namespace.IsEmpty())
+	{
+		Namespace = TEXT("/");
+	}
+
+	SocketIO = MakeShared<FCourierSocketIOConnection>();
+	TWeakPtr<SCourierWindow> WeakSelf = StaticCastSharedRef<SCourierWindow>(AsShared());
+	SocketIO->OnConnected = [WeakSelf, Namespace](const FString& Sid)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->bSocketConnecting = false;
+			Self->AddLog(FLogLine::EKind::System, FString::Printf(TEXT("Connected to namespace %s (socket id %s)"), *Namespace, *Sid));
+		}
+	};
+	SocketIO->OnConnectError = [WeakSelf](const FString& Message)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->bSocketConnecting = false;
+			Self->AddLog(FLogLine::EKind::Error, FString::Printf(TEXT("Connect error: %s"), *Message));
+		}
+	};
+	SocketIO->OnDisconnected = [WeakSelf](const FString& Reason)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->bSocketConnecting = false;
+			Self->AddLog(FLogLine::EKind::System, FString::Printf(TEXT("Disconnected (%s)"), *Reason));
+		}
+	};
+	SocketIO->OnEvent = [WeakSelf](const FString& Name, const FString& Args)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->AddLog(FLogLine::EKind::Received, Args, Name);
+		}
+	};
+	SocketIO->OnAck = [WeakSelf](int32 Id, const FString& Args)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->AddLog(FLogLine::EKind::Received, Args, FString::Printf(TEXT("ack #%d"), Id));
+		}
+	};
+	const FString Auth = FCourierHttp::ResolveVariables(Working->SocketIOAuth, Variables);
+	if (!SocketIO->Connect(Prepared.Url, Headers, Namespace, Auth))
+	{
+		AddLog(FLogLine::EKind::Error, TEXT("The URL is empty."));
+		SocketIO.Reset();
+		return;
+	}
+	bSocketConnecting = true;
+	AddLog(FLogLine::EKind::System, FString::Printf(TEXT("Connecting to %s"), *SocketIO->GetUrl()));
+}
+
+void SCourierWindow::EmitSocketIOEvent()
+{
+	if (!SocketIO.IsValid() || !SocketIO->IsConnected() || !Composer.IsValid())
+	{
+		return;
+	}
+	const TMap<FString, FString> Variables = GetVariables();
+	const FString Event = FCourierHttp::ResolveVariables(ComposerEvent, Variables).TrimStartAndEnd();
+	if (Event.IsEmpty())
+	{
+		AddLog(FLogLine::EKind::Error, TEXT("Type an event name first."));
+		return;
+	}
+	const FString Args = FCourierSocketIO::ArgsFromText(FCourierHttp::ResolveVariables(Composer->GetText().ToString(), Variables));
+	const int32 AckId = SocketIO->Emit(Event, Args, bComposerAck);
+	AddLog(FLogLine::EKind::Sent, Args, bComposerAck ? FString::Printf(TEXT("%s, ack #%d"), *Event, AckId) : Event);
+}
+
+void SCourierWindow::BuildOAuth2Panel(const TSharedRef<SVerticalBox>& Box)
+{
+	FCourierOAuth2& OAuth2 = Working->Auth.OAuth2;
+	auto Field = [this](const FText& Label, FString* Target, bool bPassword, const FText& Hint) -> TSharedRef<SWidget>
+	{
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			[
+				SNew(SBox).WidthOverride(140.f)[SNew(STextBlock).Text(Label)]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.f)
+			[
+				SNew(SEditableTextBox)
+				.Font(CourierUI::MonoFont())
+				.IsPassword(bPassword)
+				.HintText(Hint)
+				.Text(FText::FromString(*Target))
+				.OnTextChanged_Lambda([this, Target](const FText& Text) { *Target = Text.ToString(); MarkDirty(); })
+			];
+	};
+	auto Combo = [](const FText& Label, TFunction<FText()> Current, TFunction<void(FMenuBuilder&)> Fill) -> TSharedRef<SWidget>
+	{
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			[
+				SNew(SBox).WidthOverride(140.f)[SNew(STextBlock).Text(Label)]
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SComboButton)
+				.OnGetMenuContent_Lambda([Fill]() { FMenuBuilder Menu(true, nullptr); Fill(Menu); return Menu.MakeWidget(); })
+				.ButtonContent()[SNew(STextBlock).Text_Lambda([Current]() { return Current(); })]
+			];
+	};
+
+	Box->AddSlot().AutoHeight().Padding(0, 2)
+	[
+		Combo(LOCTEXT("OAuthGrant", "Grant type"),
+			[this]() { return StaticEnum<ECourierOAuth2Grant>()->GetDisplayNameTextByValue(static_cast<int64>(Working->Auth.OAuth2.GrantType)); },
+			[this](FMenuBuilder& Menu)
+			{
+				for (ECourierOAuth2Grant Grant : { ECourierOAuth2Grant::ClientCredentials, ECourierOAuth2Grant::Password, ECourierOAuth2Grant::AuthorizationCode })
+				{
+					Menu.AddMenuEntry(StaticEnum<ECourierOAuth2Grant>()->GetDisplayNameTextByValue(static_cast<int64>(Grant)), FText::GetEmpty(), FSlateIcon(),
+						FUIAction(FExecuteAction::CreateLambda([this, Grant]() { Working->Auth.OAuth2.GrantType = Grant; MarkDirty(); RebuildAuth(); })));
+				}
+			})
+	];
+	const bool bCode = OAuth2.GrantType == ECourierOAuth2Grant::AuthorizationCode;
+	if (bCode)
+	{
+		Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthAuthUrl", "Auth URL"), &OAuth2.AuthUrl, false, LOCTEXT("OAuthAuthUrlHint", "https://id.example.com/authorize"))];
+	}
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthTokenUrl", "Access token URL"), &OAuth2.AccessTokenUrl, false, LOCTEXT("OAuthTokenUrlHint", "https://id.example.com/oauth/token"))];
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthClientId", "Client ID"), &OAuth2.ClientId, false, FText::GetEmpty())];
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthClientSecret", "Client secret"), &OAuth2.ClientSecret, true, LOCTEXT("OAuthSecretHint", "{{clientSecret}}  (empty for public clients)"))];
+	if (OAuth2.GrantType == ECourierOAuth2Grant::Password)
+	{
+		Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("Username", "Username"), &OAuth2.Username, false, FText::GetEmpty())];
+		Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("Password", "Password"), &OAuth2.Password, true, FText::GetEmpty())];
+	}
+	if (bCode)
+	{
+		Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthRedirect", "Redirect URI"), &OAuth2.RedirectUri, false, LOCTEXT("OAuthRedirectHint", "http://127.0.0.1:8976/callback"))];
+	}
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthScope", "Scope"), &OAuth2.Scope, false, LOCTEXT("OAuthScopeHint", "space separated"))];
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthAudience", "Audience"), &OAuth2.Audience, false, LOCTEXT("OAuthAudienceHint", "optional"))];
+	Box->AddSlot().AutoHeight().Padding(0, 2)
+	[
+		Combo(LOCTEXT("OAuthClientAuth", "Client authentication"),
+			[this]() { return StaticEnum<ECourierOAuth2ClientAuth>()->GetDisplayNameTextByValue(static_cast<int64>(Working->Auth.OAuth2.ClientAuthentication)); },
+			[this](FMenuBuilder& Menu)
+			{
+				for (ECourierOAuth2ClientAuth Mode : { ECourierOAuth2ClientAuth::BasicHeader, ECourierOAuth2ClientAuth::Body })
+				{
+					Menu.AddMenuEntry(StaticEnum<ECourierOAuth2ClientAuth>()->GetDisplayNameTextByValue(static_cast<int64>(Mode)), FText::GetEmpty(), FSlateIcon(),
+						FUIAction(FExecuteAction::CreateLambda([this, Mode]() { Working->Auth.OAuth2.ClientAuthentication = Mode; MarkDirty(); })));
+				}
+			})
+	];
+	if (bCode)
+	{
+		Box->AddSlot().AutoHeight().Padding(148, 4, 0, 2)
+		[
+			SNew(SCheckBox)
+			.IsChecked_Lambda([this]() { return Working->Auth.OAuth2.bUsePkce ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+			.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { Working->Auth.OAuth2.bUsePkce = State == ECheckBoxState::Checked; MarkDirty(); })
+			[
+				SNew(STextBlock).Text(LOCTEXT("OAuthPkce", "Use PKCE (S256)"))
+			]
+		];
+	}
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthPrefix", "Header prefix"), &OAuth2.HeaderPrefix, false, LOCTEXT("OAuthPrefixHint", "Bearer"))];
+	Box->AddSlot().AutoHeight().Padding(0, 2)[Field(LOCTEXT("OAuthToken", "Access token"), &OAuth2.AccessToken, false, LOCTEXT("OAuthTokenHint", "empty: Courier gets one when you send"))];
+
+	Box->AddSlot().AutoHeight().Padding(0, 8, 0, 2)
+	[
+		SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
+			.Text(LOCTEXT("OAuthGetToken", "Get New Access Token"))
+			.IsEnabled_Lambda([this]() { return !bFetchingToken; })
+			.OnClicked_Lambda([this]() { FetchOAuth2Token(); return FReply::Handled(); })
+		]
+		+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 12, 0)
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("OAuthClear", "Clear Tokens"))
+			.ToolTipText(LOCTEXT("OAuthClearTip", "Forget every cached OAuth 2.0 token"))
+			.OnClicked_Lambda([]() { FCourierOAuth2Client::ClearCache(); return FReply::Handled(); })
+		]
+		+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Font(CourierUI::MonoFont(9))
+			.Text_Lambda([this]() { return GetOAuth2StatusText(); })
+			.ColorAndOpacity_Lambda([this]()
+			{
+				FCourierOAuth2Token Token;
+				const bool bHas = FCourierOAuth2Client::GetCachedToken(FCourierOAuth2Client::Resolve(Working->Auth.OAuth2, GetVariables()), Token);
+				return bHas && (Token.ExpiresAt.GetTicks() == 0 || Token.ExpiresAt > FDateTime::UtcNow()) ? FSlateColor(FLinearColor(0.42f, 0.83f, 0.47f)) : CourierWindow::Subdued;
+			})
+		]
+	];
+	Box->AddSlot().AutoHeight().Padding(0, 6, 0, 0)
+	[
+		SNew(STextBlock).AutoWrapText(true).ColorAndOpacity(CourierWindow::Subdued)
+		.Text(bCode
+			? LOCTEXT("OAuthCodeHelp", "Send (or Get New Access Token) opens your browser at the Auth URL and catches the redirect on the Redirect URI, which must be a 127.0.0.1 or localhost address registered with the provider. Tokens are cached and refreshed automatically.")
+			: LOCTEXT("OAuthHelp", "Send gets a token when there is none, refreshes it when it expires, and adds the Authorization header. Tokens are cached per token URL, client and scope."))
+	];
+}
+
+FText SCourierWindow::GetOAuth2StatusText() const
+{
+	if (bFetchingToken)
+	{
+		return LOCTEXT("OAuthFetching", "Getting a token...");
+	}
+	const FCourierOAuth2 Resolved = FCourierOAuth2Client::Resolve(Working->Auth.OAuth2, GetVariables());
+	if (!Resolved.AccessToken.IsEmpty())
+	{
+		return LOCTEXT("OAuthGiven", "Using the access token typed above");
+	}
+	FCourierOAuth2Token Token;
+	if (!FCourierOAuth2Client::GetCachedToken(Resolved, Token))
+	{
+		return LOCTEXT("OAuthNoToken", "No token yet");
+	}
+	const FString Preview = Token.AccessToken.Len() > 14 ? Token.AccessToken.Left(10) + TEXT("...") + Token.AccessToken.Right(4) : Token.AccessToken;
+	return FText::Format(LOCTEXT("OAuthHasToken", "{0}   {1}{2}"), FText::FromString(Preview), CourierWindow::DescribeExpiry(Token.ExpiresAt),
+		Token.RefreshToken.IsEmpty() ? FText::GetEmpty() : LOCTEXT("OAuthRefreshable", ", refresh token kept"));
+}
+
+void SCourierWindow::FetchOAuth2Token()
+{
+	bFetchingToken = true;
+	TWeakPtr<SCourierWindow> WeakSelf = StaticCastSharedRef<SCourierWindow>(AsShared());
+	FCourierOAuth2Client::GetToken(FCourierOAuth2Client::Resolve(Working->Auth.OAuth2, GetVariables()), [WeakSelf](const FCourierOAuth2Token& Token)
+	{
+		if (const TSharedPtr<SCourierWindow> Self = WeakSelf.Pin())
+		{
+			Self->bFetchingToken = false;
+		}
+		CourierUI::Notify(Token.bSuccess
+			? LOCTEXT("OAuthGot", "OAuth 2.0: got a new access token")
+			: FText::Format(LOCTEXT("OAuthFailed", "OAuth 2.0: {0}"), FText::FromString(Token.Error)), Token.bSuccess);
+	}, true);
+}
+
+TSharedRef<SWidget> SCourierWindow::BuildCookiesPanel()
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(4)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.ColorAndOpacity(CourierWindow::Subdued)
+				.Text_Lambda([this]() { return FText::Format(LOCTEXT("CookieCount", "{0} cookies"), FText::AsNumber(CookieItems.Num())); })
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+				.Text(LOCTEXT("ClearCookies", "Clear All"))
+				.OnClicked_Lambda([]()
+				{
+					if (CourierUI::Confirm(LOCTEXT("ConfirmClearCookies", "Remove every cookie from the jar?")))
+					{
+						FCourierCookieJar::Get().Clear();
+					}
+					return FReply::Handled();
+				})
+			]
+		]
+		+ SVerticalBox::Slot().FillHeight(1.f)
+		[
+			SAssignNew(CookieList, SListView<TSharedPtr<FCourierCookie>>)
+			.ListItemsSource(&CookieItems)
+			.SelectionMode(ESelectionMode::Single)
+			.OnGenerateRow(this, &SCourierWindow::OnGenerateCookieRow)
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(4)
+		[
+			SNew(STextBlock).AutoWrapText(true).ColorAndOpacity(CourierWindow::Subdued).Font(FAppStyle::GetFontStyle("SmallFont"))
+			.Text(LOCTEXT("CookiesHelp", "Requests send matching cookies and keep the ones servers set (per request: Settings > Send and store cookies). Kept in Saved/Courier/Cookies.json."))
+		];
+}
+
+void SCourierWindow::RefreshCookies()
+{
+	CookieItems.Reset();
+	TArray<FCourierCookie> All = FCourierCookieJar::Get().GetCookies();
+	All.Sort([](const FCourierCookie& A, const FCourierCookie& B) { return A.Domain == B.Domain ? A.Name < B.Name : A.Domain < B.Domain; });
+	for (const FCourierCookie& Cookie : All)
+	{
+		CookieItems.Add(MakeShared<FCourierCookie>(Cookie));
+	}
+	if (CookieList.IsValid())
+	{
+		CookieList->RequestListRefresh();
+	}
+}
+
+TSharedRef<ITableRow> SCourierWindow::OnGenerateCookieRow(TSharedPtr<FCourierCookie> Cookie, const TSharedRef<STableViewBase>& Owner)
+{
+	const FText Expiry = Cookie->Expires.GetTicks() == 0 ? LOCTEXT("SessionCookie", "session") : CourierWindow::DescribeExpiry(Cookie->Expires);
+	TArray<FString> Flags;
+	if (Cookie->bSecure) { Flags.Add(TEXT("Secure")); }
+	if (Cookie->bHttpOnly) { Flags.Add(TEXT("HttpOnly")); }
+	const FString Where = (Cookie->bHostOnly ? FString() : FString(TEXT("."))) + Cookie->Domain + (Cookie->Path == TEXT("/") ? FString() : Cookie->Path);
+	const FString Value = Cookie->Value.Len() > 40 ? Cookie->Value.Left(37) + TEXT("...") : Cookie->Value;
+	return SNew(STableRow<TSharedPtr<FCourierCookie>>, Owner)
+		.Padding(FMargin(4, 3))
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.f)
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(STextBlock).Font(CourierUI::MonoFont(9))
+					.Text(FText::FromString(Cookie->Name + TEXT("=") + Value))
+					.ToolTipText(FText::FromString(Cookie->Value))
+				]
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(STextBlock).Font(FAppStyle::GetFontStyle("SmallFont")).ColorAndOpacity(CourierWindow::Subdued)
+					.Text(FText::Format(LOCTEXT("CookieMeta", "{0}   {1}{2}"), FText::FromString(Where), Expiry,
+						Flags.Num() ? FText::FromString(TEXT("   ") + FString::Join(Flags, TEXT(", "))) : FText::GetEmpty()))
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+				.ToolTipText(LOCTEXT("DeleteCookie", "Delete this cookie"))
+				.OnClicked_Lambda([Cookie]() { FCourierCookieJar::Get().Remove(Cookie->Domain, Cookie->Name); return FReply::Handled(); })
+				[
+					SNew(SImage).Image(FAppStyle::GetBrush("Icons.X")).ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				]
+			]
+		];
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2201,6 +2727,9 @@ void SCourierWindow::NewRequest(ECourierProtocol Protocol, ECourierBodyType Body
 	case ECourierProtocol::ServerSentEvents:
 		Spec.Name = TEXT("New Event Stream");
 		break;
+	case ECourierProtocol::SocketIO:
+		Spec.Name = TEXT("New Socket.IO");
+		break;
 	default:
 		Spec.Name = BodyType == ECourierBodyType::GraphQL ? TEXT("New GraphQL Request") : TEXT("New Request");
 		Spec.Verb = BodyType == ECourierBodyType::GraphQL ? ECourierVerb::Post : ECourierVerb::Get;
@@ -2222,6 +2751,7 @@ void SCourierWindow::LoadRequest(const FCourierRequestSpec& Spec, const FGuid& C
 	bSending = false;
 	Socket.Reset();
 	Sse.Reset();
+	SocketIO.Reset();
 	LogLines.Reset();
 	LastResponse.Reset();
 	ResponseBodyText = FText::GetEmpty();
@@ -2234,7 +2764,7 @@ void SCourierWindow::LoadRequest(const FCourierRequestSpec& Spec, const FGuid& C
 	WorkingCollectionId = CollectionId;
 	SourceAsset = Asset;
 	bDirty = false;
-	if (RequestTab == 2 && Spec.Protocol == ECourierProtocol::WebSocket)
+	if (RequestTab == 2 && CourierWindow::HasNoBody(Spec.Protocol))
 	{
 		RequestTab = 0;
 	}

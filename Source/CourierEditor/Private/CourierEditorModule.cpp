@@ -1,5 +1,7 @@
 #include "CourierEditorModule.h"
 
+#include "CourierCookies.h"
+#include "Misc/Paths.h"
 #include "Framework/Docking/TabManager.h"
 #include "SCourierWindow.h"
 #include "Styling/AppStyle.h"
@@ -43,10 +45,16 @@ void FCourierEditorModule::StartupModule()
 	FTabManager::RegisterDefaultTabWindowSize(TabName, FVector2D(1400.f, 900.f));
 
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FCourierEditorModule::RegisterMenus));
+
+	// The editor keeps the cookie jar between sessions, like Postman.
+	const FString CookieFile = FPaths::ProjectSavedDir() / TEXT("Courier") / TEXT("Cookies.json");
+	FCourierCookieJar::Get().LoadFromFile(CookieFile);
+	CookiesChangedHandle = FCourierCookieJar::Get().OnChanged.AddLambda([CookieFile]() { FCourierCookieJar::Get().SaveToFile(CookieFile); });
 }
 
 void FCourierEditorModule::ShutdownModule()
 {
+	FCourierCookieJar::Get().OnChanged.Remove(CookiesChangedHandle);
 	UToolMenus::UnRegisterStartupCallback(this);
 	UToolMenus::UnregisterOwner(this);
 	if (FSlateApplication::IsInitialized())

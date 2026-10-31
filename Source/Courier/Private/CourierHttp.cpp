@@ -1,6 +1,8 @@
 #include "CourierHttp.h"
 
 #include "Async/Async.h"
+#include "CourierCookies.h"
+#include "CourierOAuth2.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
@@ -247,8 +249,23 @@ TArray<FString> FCourierHttp::FindVariableNames(const FCourierRequestSpec& Spec)
 		CourierHttp::CollectNames(Spec.Auth.ApiKeyName, Names);
 		CourierHttp::CollectNames(Spec.Auth.ApiKeyValue, Names);
 		break;
+	case ECourierAuthType::OAuth2:
+	{
+		const FCourierOAuth2& OAuth2 = Spec.Auth.OAuth2;
+		for (const FString* Field : { &OAuth2.AccessTokenUrl, &OAuth2.AuthUrl, &OAuth2.ClientId, &OAuth2.ClientSecret, &OAuth2.Scope,
+			&OAuth2.Audience, &OAuth2.Username, &OAuth2.Password, &OAuth2.RedirectUri, &OAuth2.AccessToken })
+		{
+			CourierHttp::CollectNames(*Field, Names);
+		}
+		break;
+	}
 	default:
 		break;
+	}
+	if (Spec.Protocol == ECourierProtocol::SocketIO)
+	{
+		CourierHttp::CollectNames(Spec.SocketIONamespace, Names);
+		CourierHttp::CollectNames(Spec.SocketIOAuth, Names);
 	}
 	return Names;
 }
@@ -426,8 +443,30 @@ bool FCourierHttp::Prepare(const FCourierRequestSpec& Spec, const TMap<FString, 
 			Out.Headers.Emplace(ResolveVariables(Spec.Auth.ApiKeyName, Variables), ResolveVariables(Spec.Auth.ApiKeyValue, Variables));
 		}
 		break;
+	case ECourierAuthType::OAuth2:
+		if (!CourierHttp::HasHeader(Out.Headers, TEXT("Authorization")))
+		{
+			// The token was fetched (or given) before Prepare; Send takes care of that.
+			const FCourierOAuth2 OAuth2 = FCourierOAuth2Client::Resolve(Spec.Auth.OAuth2, Variables);
+			const FString Token = FCourierOAuth2Client::FindUsableToken(OAuth2, false);
+			if (!Token.IsEmpty())
+			{
+				Out.Headers.Emplace(TEXT("Authorization"), OAuth2.HeaderPrefix.IsEmpty() ? Token : OAuth2.HeaderPrefix + TEXT(" ") + Token);
+			}
+		}
+		break;
 	default:
 		break;
+	}
+
+	Out.bUseCookieJar = Spec.bUseCookieJar;
+	if (Spec.bUseCookieJar && !CourierHttp::HasHeader(Out.Headers, TEXT("Cookie")))
+	{
+		const FString Cookies = FCourierCookieJar::Get().GetCookieHeader(Out.Url);
+		if (!Cookies.IsEmpty())
+		{
+			Out.Headers.Emplace(TEXT("Cookie"), Cookies);
+		}
 	}
 
 	FString ContentType = DefaultContentType(Spec.BodyType);
@@ -544,6 +583,55 @@ bool FCourierHttp::Prepare(const FCourierRequestSpec& Spec, const TMap<FString, 
 
 FHttpRequestPtr FCourierHttp::Send(const FCourierRequestSpec& Spec, const TMap<FString, FString>& Variables, FOnComplete OnComplete, FOnProgress OnProgress)
 {
+	const bool bExplicitAuthorization = Spec.Headers.ContainsByPredicate([](const FCourierKeyValue& Row)
+	{
+		return Row.bEnabled && Row.Key.Equals(TEXT("Authorization"), ESearchCase::IgnoreCase);
+	});
+	if (Spec.Auth.Type == ECourierAuthType::OAuth2 && !bExplicitAuthorization)
+	{
+		const FCourierOAuth2 OAuth2 = FCourierOAuth2Client::Resolve(Spec.Auth.OAuth2, Variables);
+		if (FCourierOAuth2Client::FindUsableToken(OAuth2, true).IsEmpty())
+		{
+			FCourierOAuth2Client::GetToken(OAuth2, [Spec, Variables, OnComplete, OnProgress](const FCourierOAuth2Token& Token) mutable
+			{
+				if (!Token.bSuccess)
+				{
+					FCourierResponse Failed;
+					Failed.Error = TEXT("OAuth 2.0: ") + Token.Error;
+					Failed.Url = BuildUrl(Spec, Variables);
+					Failed.Verb = VerbToString(Spec.Verb, Spec.CustomVerb);
+					if (OnComplete)
+					{
+						OnComplete(Failed);
+					}
+					return;
+				}
+				// The token is cached now, so Prepare puts it in the Authorization header.
+				FCourierRequestSpec WithToken = Spec;
+				if (FCourierOAuth2Client::FindUsableToken(FCourierOAuth2Client::Resolve(Spec.Auth.OAuth2, Variables), false).IsEmpty())
+				{
+					WithToken.Auth.OAuth2.AccessToken = Token.AccessToken;
+				}
+				FCourierPreparedRequest Prepared;
+				FString Error;
+				if (!Prepare(WithToken, Variables, Prepared, Error))
+				{
+					FCourierResponse Failed;
+					Failed.Error = Error;
+					Failed.Url = Prepared.Url;
+					Failed.Verb = Prepared.Verb;
+					if (OnComplete)
+					{
+						OnComplete(Failed);
+					}
+					return;
+				}
+				SendPrepared(Prepared, MoveTemp(OnComplete), MoveTemp(OnProgress));
+			});
+			return nullptr;
+		}
+	}
+
 	FCourierPreparedRequest Prepared;
 	FString Error;
 	if (!Prepare(Spec, Variables, Prepared, Error))
@@ -584,8 +672,13 @@ FHttpRequestPtr FCourierHttp::SendPrepared(const FCourierPreparedRequest& Prepar
 	}
 
 	const double StartTime = FPlatformTime::Seconds();
-	Request->OnProcessRequestComplete().BindLambda([OnComplete = MoveTemp(OnComplete), StartTime](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bConnected)
+	const bool bUseCookieJar = Prepared.bUseCookieJar;
+	Request->OnProcessRequestComplete().BindLambda([OnComplete = MoveTemp(OnComplete), StartTime, bUseCookieJar](FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bConnected)
 	{
+		if (bUseCookieJar && Req.IsValid() && Resp.IsValid() && Resp->GetResponseCode() > 0)
+		{
+			FCourierCookieJar::Get().StoreFromResponseHeaders(Req->GetURL(), Resp->GetAllHeaders());
+		}
 		const FCourierResponse Response = CourierHttp::MakeResponse(Req, Resp, bConnected, StartTime);
 		UE_LOG(LogCourier, Verbose, TEXT("Courier: %s %s -> %d (%.0f ms)"), *Response.Verb, *Response.Url, Response.StatusCode, Response.ElapsedSeconds * 1000.f);
 		if (OnComplete)

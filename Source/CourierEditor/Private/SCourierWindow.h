@@ -7,12 +7,14 @@
 #include "Widgets/Views/STableRow.h"
 #include "Widgets/Views/STreeView.h"
 
+class FCourierSocketIOConnection;
 class FCourierSseConnection;
 class IWebSocket;
 class SBox;
 class SMultiLineEditableTextBox;
 class SVerticalBox;
 class UCourierRequestAsset;
+struct FCourierCookie;
 struct FCourierHistoryEntry;
 template <typename ItemType> class SListView;
 
@@ -79,6 +81,9 @@ private:
 	void ShowCollectionEditor(const FGuid& CollectionId);
 	void RebuildBody();
 	void RebuildAuth();
+	void BuildOAuth2Panel(const TSharedRef<SVerticalBox>& Box);
+	FText GetOAuth2StatusText() const;
+	void FetchOAuth2Token();
 	void RebuildResponseHeaders();
 	void RebuildEnvironments();
 
@@ -89,6 +94,11 @@ private:
 	void OnTreeSelectionChanged(FTreeItemPtr Item, ESelectInfo::Type SelectInfo);
 	void OnTreeExpansionChanged(FTreeItemPtr Item, bool bExpanded);
 	TSharedPtr<SWidget> OnTreeContextMenu();
+
+	// ---- Cookies ----
+	TSharedRef<SWidget> BuildCookiesPanel();
+	void RefreshCookies();
+	TSharedRef<ITableRow> OnGenerateCookieRow(TSharedPtr<FCourierCookie> Cookie, const TSharedRef<STableViewBase>& Owner);
 
 	// ---- History ----
 	void RefreshHistory();
@@ -116,6 +126,8 @@ private:
 	void ToggleStream();
 	void ConnectWebSocket();
 	void ConnectSse();
+	void ConnectSocketIO();
+	void EmitSocketIOEvent();
 	void CloseStreams();
 	bool IsStreamOpen() const;
 	void SendWebSocketMessage();
@@ -151,6 +163,15 @@ private:
 	TSharedPtr<SListView<FLogLinePtr>> LogList;
 	TSharedPtr<SMultiLineEditableTextBox> Composer;
 	TArray<uint8> PendingBinary;
+	TSharedPtr<FCourierSocketIOConnection> SocketIO;
+	FString ComposerEvent = TEXT("message");
+	bool bComposerAck = false;
+
+	// OAuth 2.0 and cookies.
+	bool bFetchingToken = false;
+	TArray<TSharedPtr<FCourierCookie>> CookieItems;
+	TSharedPtr<SListView<TSharedPtr<FCourierCookie>>> CookieList;
+	FDelegateHandle CookiesChangedHandle;
 
 	// Widgets.
 	TSharedPtr<SBox> RightHost;

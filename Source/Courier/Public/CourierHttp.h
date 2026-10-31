@@ -12,6 +12,8 @@ struct COURIER_API FCourierPreparedRequest
 	TArray<TPair<FString, FString>> Headers;
 	TArray<uint8> Body;
 	float TimeoutSeconds = 0.f;
+	/** Store the response's Set-Cookie headers in FCourierCookieJar::Get(). */
+	bool bUseCookieJar = false;
 };
 
 /**
@@ -45,7 +47,8 @@ public:
 
 	/**
 	 * Sends the request. OnComplete always runs exactly once, on the game thread, also when the request
-	 * cannot be built (then the next tick). Cancel through the returned request.
+	 * cannot be built (then the next tick). Cancel through the returned request. With OAuth 2.0 auth and no
+	 * usable token, a token is fetched first and the returned pointer is null.
 	 */
 	static FHttpRequestPtr Send(const FCourierRequestSpec& Spec, const TMap<FString, FString>& Variables, FOnComplete OnComplete, FOnProgress OnProgress = nullptr);
 

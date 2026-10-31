@@ -1,0 +1,9 @@
+{
+  "name": "courier-test-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Socket.IO server and mock OAuth 2.0 provider for Courier's live tests and demos.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "socket.io": "4.8.1" }
+}

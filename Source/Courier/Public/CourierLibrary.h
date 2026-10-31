@@ -99,6 +99,45 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Courier|Postman")
 	static FString ExportPostmanEnvironment(const FCourierEnvironment& Environment);
 
+	// ---- Cookies (one jar for every Courier request in the process) ----
+
+	/** Cookies that would be sent to Url; every cookie when Url is empty. */
+	UFUNCTION(BlueprintPure, Category = "Courier|Cookies")
+	static TArray<FCourierCookie> GetCourierCookies(const FString& Url);
+
+	/** The Cookie header Courier would send to Url. */
+	UFUNCTION(BlueprintPure, Category = "Courier|Cookies")
+	static FString GetCourierCookieHeader(const FString& Url);
+
+	/** Adds or replaces a cookie (same domain, path and name). */
+	UFUNCTION(BlueprintCallable, Category = "Courier|Cookies")
+	static void SetCourierCookie(const FCourierCookie& Cookie);
+
+	/** Removes the cookies of Domain, or just the one called Name. Returns how many were removed. */
+	UFUNCTION(BlueprintCallable, Category = "Courier|Cookies")
+	static int32 RemoveCourierCookies(const FString& Domain, const FString& Name);
+
+	UFUNCTION(BlueprintCallable, Category = "Courier|Cookies")
+	static void ClearCourierCookies();
+
+	/** Writes the jar (minus expired cookies) as JSON, e.g. to keep a login across game sessions. */
+	UFUNCTION(BlueprintCallable, Category = "Courier|Cookies")
+	static bool SaveCourierCookies(const FString& FilePath);
+
+	/** Adds cookies saved by Save Courier Cookies. */
+	UFUNCTION(BlueprintCallable, Category = "Courier|Cookies")
+	static bool LoadCourierCookies(const FString& FilePath);
+
+	// ---- OAuth 2.0 ----
+
+	/** The cached token for these settings, if Courier has one (valid or expired). */
+	UFUNCTION(BlueprintCallable, Category = "Courier|OAuth2", meta = (AutoCreateRefTerm = "Variables"))
+	static bool GetCachedCourierOAuth2Token(const FCourierOAuth2& Settings, const TMap<FString, FString>& Variables, FCourierOAuth2Token& OutToken);
+
+	/** Forgets every cached OAuth 2.0 token (for example on sign-out). */
+	UFUNCTION(BlueprintCallable, Category = "Courier|OAuth2")
+	static void ClearCourierOAuth2Tokens();
+
 	// ---- Used by the "Courier: <asset>" Blueprint node ----
 
 	UFUNCTION(BlueprintCallable, Category = "Courier|Internal", meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject", AutoCreateRefTerm = "Variables"))

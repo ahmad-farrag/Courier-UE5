@@ -1,7 +1,11 @@
+#include "CourierCookies.h"
 #include "CourierEventSource.h"
+#include "CourierOAuth2.h"
+#include "CourierSocketIO.h"
 #include "CourierLibrary.h"
 #include "CourierLiveTestListener.h"
 #include "CourierSendRequest.h"
+#include "HAL/PlatformMisc.h"
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 
@@ -124,6 +128,172 @@ bool FCourierLiveSseTest::RunTest(const FString& Parameters)
 			TestFalse(TEXT("event has an id"), L->SseEvents[0].Id.IsEmpty());
 		}
 		TestFalse(TEXT("not closed with an error"), L->bSseClosed && !L->SseClosedError.IsEmpty());
+	}));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCourierLiveCookiesTest, "Courier.Live.Cookies", CourierLiveTests::Flags)
+bool FCourierLiveCookiesTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<TStrongObjectPtr<UCourierLiveTestListener>> Listener = MakeShared<TStrongObjectPtr<UCourierLiveTestListener>>(NewObject<UCourierLiveTestListener>());
+	UCourierLiveTestListener* L = Listener->Get();
+	FCourierCookieJar::Get().Remove(TEXT("postman-echo.com"));
+
+	// /response-headers answers 200 with the Set-Cookie header we ask for. (The engine's HTTP layer drops the
+	// headers of redirect responses, so cookies set on a 3xx never reach any jar; /cookies/set redirects.)
+	FCourierRequestSpec Set;
+	Set.Url = TEXT("https://postman-echo.com/response-headers");
+	Set.QueryParams.Emplace(TEXT("Set-Cookie"), TEXT("courier=jar; Path=/"));
+	UCourierSendRequest* First = UCourierLibrary::CreateCourierRequest(nullptr, Set, {});
+	First->OnSuccess.AddDynamic(L, &UCourierLiveTestListener::HandleSuccess);
+	First->OnFailure.AddDynamic(L, &UCourierLiveTestListener::HandleFailure);
+	First->Send();
+
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->Successes.Num() + L->Failures.Num() >= 1; }, TEXT("the cookie to be set"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, L]()
+	{
+		TestTrue(TEXT("jar holds the cookie"), FCourierCookieJar::Get().GetCookieHeader(TEXT("https://postman-echo.com/cookies")).Contains(TEXT("courier=jar")));
+		FCourierRequestSpec Read;
+		Read.Url = TEXT("https://postman-echo.com/cookies");
+		UCourierSendRequest* Second = UCourierLibrary::CreateCourierRequest(nullptr, Read, {});
+		Second->OnSuccess.AddDynamic(L, &UCourierLiveTestListener::HandleSuccess);
+		Second->OnFailure.AddDynamic(L, &UCourierLiveTestListener::HandleFailure);
+		Second->Send();
+	}));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->Successes.Num() + L->Failures.Num() >= 2; }, TEXT("the cookie echo"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, Listener]()
+	{
+		const UCourierLiveTestListener* L = Listener->Get();
+		const FCourierResponse* Echo = L->Successes.FindByPredicate([](const FCourierResponse& R) { return R.Url.EndsWith(TEXT("/cookies")); });
+		FString Value;
+		TestTrue(TEXT("server saw the cookie"), Echo && UCourierLibrary::GetJsonString(Echo->Body, TEXT("cookies.courier"), Value) && Value == TEXT("jar"));
+		FCourierCookieJar::Get().Remove(TEXT("postman-echo.com"));
+	}));
+	return true;
+}
+
+// Courier.Live.OAuth2 and Courier.Live.SocketIO need test servers: set COURIER_TEST_OAUTH_URL (a mock token server,
+// see docs) and COURIER_TEST_SOCKETIO_URL. Without them the tests report that they skipped.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCourierLiveOAuth2Test, "Courier.Live.OAuth2", CourierLiveTests::Flags)
+bool FCourierLiveOAuth2Test::RunTest(const FString& Parameters)
+{
+	const FString Base = FPlatformMisc::GetEnvironmentVariable(TEXT("COURIER_TEST_OAUTH_URL"));
+	if (Base.IsEmpty())
+	{
+		AddInfo(TEXT("Skipped: COURIER_TEST_OAUTH_URL is not set."));
+		return true;
+	}
+	FCourierOAuth2Client::ClearCache();
+	TSharedRef<TStrongObjectPtr<UCourierLiveTestListener>> Listener = MakeShared<TStrongObjectPtr<UCourierLiveTestListener>>(NewObject<UCourierLiveTestListener>());
+	UCourierLiveTestListener* L = Listener->Get();
+	auto Send = [L](const FCourierRequestSpec& Spec)
+	{
+		UCourierSendRequest* Action = UCourierLibrary::CreateCourierRequest(nullptr, Spec, {});
+		Action->OnSuccess.AddDynamic(L, &UCourierLiveTestListener::HandleSuccess);
+		Action->OnFailure.AddDynamic(L, &UCourierLiveTestListener::HandleFailure);
+		Action->Send();
+	};
+	auto Me = [Base](const FString& Client, const FString& Secret)
+	{
+		FCourierRequestSpec Spec;
+		Spec.Url = Base + TEXT("/me?as=") + Client;
+		Spec.Auth.Type = ECourierAuthType::OAuth2;
+		Spec.Auth.OAuth2.AccessTokenUrl = Base + TEXT("/token");
+		Spec.Auth.OAuth2.ClientId = Client;
+		Spec.Auth.OAuth2.ClientSecret = Secret;
+		Spec.Auth.OAuth2.Scope = TEXT("scores");
+		return Spec;
+	};
+
+	// Client credentials: Send fetches a token, then calls /me with it. A wrong secret fails before /me.
+	Send(Me(TEXT("game"), TEXT("secret")));
+	Send(Me(TEXT("game-bad"), TEXT("wrong")));
+
+	// Password grant through the Blueprint async node.
+	FCourierOAuth2 Password;
+	Password.GrantType = ECourierOAuth2Grant::Password;
+	Password.AccessTokenUrl = Base + TEXT("/token");
+	Password.ClientId = TEXT("game");
+	Password.ClientSecret = TEXT("secret");
+	Password.ClientAuthentication = ECourierOAuth2ClientAuth::Body;
+	Password.Username = TEXT("ada");
+	Password.Password = TEXT("hunter2");
+	UCourierOAuth2Task* Task = UCourierOAuth2Task::GetCourierOAuth2Token(nullptr, Password, {});
+	Task->OnSuccess.AddDynamic(L, &UCourierLiveTestListener::HandleToken);
+	Task->OnFailure.AddDynamic(L, &UCourierLiveTestListener::HandleToken);
+	Task->Activate();
+
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->Successes.Num() + L->Failures.Num() >= 2 && L->Tokens.Num() >= 1; }, TEXT("token grants"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, L, Send, Me]()
+	{
+		const FCourierResponse* Ok = L->Successes.FindByPredicate([](const FCourierResponse& R) { return R.Url.Contains(TEXT("as=game")); });
+		FString Client;
+		TestTrue(TEXT("client credentials reached /me"), Ok && UCourierLibrary::GetJsonString(Ok->Body, TEXT("client"), Client) && Client == TEXT("game"));
+		const FCourierResponse* Bad = L->Failures.FindByPredicate([](const FCourierResponse& R) { return R.Url.Contains(TEXT("as=game-bad")); });
+		TestTrue(TEXT("bad secret fails with the OAuth error"), Bad && Bad->Error.Contains(TEXT("invalid_client")) && !Bad->bReceivedResponse);
+		TestTrue(TEXT("password grant token"), L->Tokens.Num() == 1 && L->Tokens[0].bSuccess && !L->Tokens[0].RefreshToken.IsEmpty());
+
+		// "short" tokens live 1 second: the second Send must use the refresh token.
+		Send(Me(TEXT("short"), TEXT("secret")));
+	}));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->Successes.Num() >= 2; }, TEXT("the short-lived token"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([L, Send, Me]() { Send(Me(TEXT("short"), TEXT("secret"))); }));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->Successes.Num() + L->Failures.Num() >= 4; }, TEXT("the refreshed request"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, Listener]()
+	{
+		const UCourierLiveTestListener* L = Listener->Get();
+		const int32 ShortOk = L->Successes.FilterByPredicate([](const FCourierResponse& R) { return R.Url.Contains(TEXT("as=short")); }).Num();
+		TestEqual(TEXT("both short requests succeeded"), ShortOk, 2);
+		const FCourierResponse* Last = L->Successes.Num() > 0 ? &L->Successes.Last() : nullptr;
+		FString Grant;
+		TestTrue(TEXT("second token came from refresh_token"), Last && UCourierLibrary::GetJsonString(Last->Body, TEXT("grant"), Grant) && Grant == TEXT("refresh_token"));
+	}));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCourierLiveSocketIOTest, "Courier.Live.SocketIO", CourierLiveTests::Flags)
+bool FCourierLiveSocketIOTest::RunTest(const FString& Parameters)
+{
+	const FString Url = FPlatformMisc::GetEnvironmentVariable(TEXT("COURIER_TEST_SOCKETIO_URL"));
+	if (Url.IsEmpty())
+	{
+		AddInfo(TEXT("Skipped: COURIER_TEST_SOCKETIO_URL is not set."));
+		return true;
+	}
+	TSharedRef<TStrongObjectPtr<UCourierLiveTestListener>> Listener = MakeShared<TStrongObjectPtr<UCourierLiveTestListener>>(NewObject<UCourierLiveTestListener>());
+	UCourierLiveTestListener* L = Listener->Get();
+	auto Make = [L](const FString& InUrl, const FString& Namespace, const FString& Auth)
+	{
+		UCourierSocketIO* Client = UCourierSocketIO::CreateCourierSocketIO(InUrl, Namespace, Auth, {});
+		Client->OnConnected.AddDynamic(L, &UCourierLiveTestListener::HandleSioConnected);
+		Client->OnConnectError.AddDynamic(L, &UCourierLiveTestListener::HandleSioError);
+		Client->OnDisconnected.AddDynamic(L, &UCourierLiveTestListener::HandleSioDisconnected);
+		Client->OnEvent.AddDynamic(L, &UCourierLiveTestListener::HandleSioEvent);
+		Client->OnAck.AddDynamic(L, &UCourierLiveTestListener::HandleSioAck);
+		return MakeShared<TStrongObjectPtr<UCourierSocketIO>>(Client);
+	};
+	const auto Main = Make(Url, TEXT("/"), FString());
+	const auto Refused = Make(Url, TEXT("/match"), TEXT("{\"token\":\"wrong\"}"));
+	Main->Get()->Connect();
+	Refused->Get()->Connect();
+
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return !L->SioSocketId.IsEmpty() && L->SioErrors.Num() >= 1; }, TEXT("connect and connect error"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, L, Main]()
+	{
+		TestTrue(TEXT("refused namespace reports the server's message"), L->SioErrors.Num() >= 1 && L->SioErrors[0].Contains(TEXT("unauthorized")));
+		TestTrue(TEXT("emit"), Main->Get()->Emit(TEXT("echo"), TEXT("{\"x\":1}")));
+		TestEqual(TEXT("ack id"), Main->Get()->EmitWithAck(TEXT("add"), TEXT("{\"a\":2,\"b\":3}")), 0);
+	}));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierWaitFor(this, [L]() { return L->SioAcks.Num() >= 1 && L->SioEvents.ContainsByPredicate([](const FString& E) { return E.StartsWith(TEXT("echo ")); }); }, TEXT("echo and ack"), FPlatformTime::Seconds()));
+	ADD_LATENT_AUTOMATION_COMMAND(FCourierRun([this, Listener, Main, Refused]()
+	{
+		const UCourierLiveTestListener* L = Listener->Get();
+		TestTrue(TEXT("welcome event"), L->SioEvents.ContainsByPredicate([](const FString& E) { return E.StartsWith(TEXT("welcome [")); }));
+		TestTrue(TEXT("echo came back"), L->SioEvents.Contains(TEXT("echo [{\"x\":1}]")));
+		TestEqual(TEXT("ack"), L->SioAcks.Num() > 0 ? L->SioAcks[0] : FString(), FString(TEXT("0 [{\"sum\":5}]")));
+		Main->Get()->Disconnect();
+		Refused->Get()->Disconnect();
+		TestTrue(TEXT("disconnect reported"), L->SioDisconnects.Contains(TEXT("io client disconnect")));
 	}));
 	return true;
 }

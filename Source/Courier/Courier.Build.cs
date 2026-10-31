@@ -17,6 +17,7 @@ public class Courier : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			"HTTPServer",
 			"JsonUtilities",
 			"WebSockets"
 		});

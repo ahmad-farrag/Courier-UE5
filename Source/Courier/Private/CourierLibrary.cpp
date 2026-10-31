@@ -1,6 +1,8 @@
 #include "CourierLibrary.h"
 
+#include "CourierCookies.h"
 #include "CourierHttp.h"
+#include "CourierOAuth2.h"
 #include "CourierPostman.h"
 #include "CourierRequestAsset.h"
 #include "CourierSendRequest.h"
@@ -252,6 +254,51 @@ bool UCourierLibrary::ImportPostmanEnvironment(const FString& Json, FCourierEnvi
 FString UCourierLibrary::ExportPostmanEnvironment(const FCourierEnvironment& Environment)
 {
 	return FCourierPostman::ExportEnvironment(Environment);
+}
+
+TArray<FCourierCookie> UCourierLibrary::GetCourierCookies(const FString& Url)
+{
+	return FCourierCookieJar::Get().GetCookies(Url);
+}
+
+FString UCourierLibrary::GetCourierCookieHeader(const FString& Url)
+{
+	return FCourierCookieJar::Get().GetCookieHeader(Url);
+}
+
+void UCourierLibrary::SetCourierCookie(const FCourierCookie& Cookie)
+{
+	FCourierCookieJar::Get().SetCookie(Cookie);
+}
+
+int32 UCourierLibrary::RemoveCourierCookies(const FString& Domain, const FString& Name)
+{
+	return FCourierCookieJar::Get().Remove(Domain, Name);
+}
+
+void UCourierLibrary::ClearCourierCookies()
+{
+	FCourierCookieJar::Get().Clear();
+}
+
+bool UCourierLibrary::SaveCourierCookies(const FString& FilePath)
+{
+	return FCourierCookieJar::Get().SaveToFile(FilePath);
+}
+
+bool UCourierLibrary::LoadCourierCookies(const FString& FilePath)
+{
+	return FCourierCookieJar::Get().LoadFromFile(FilePath);
+}
+
+bool UCourierLibrary::GetCachedCourierOAuth2Token(const FCourierOAuth2& Settings, const TMap<FString, FString>& Variables, FCourierOAuth2Token& OutToken)
+{
+	return FCourierOAuth2Client::GetCachedToken(FCourierOAuth2Client::Resolve(Settings, Variables), OutToken);
+}
+
+void UCourierLibrary::ClearCourierOAuth2Tokens()
+{
+	FCourierOAuth2Client::ClearCache();
 }
 
 UCourierSendRequest* UCourierLibrary::SendCourierRequestAsset(UObject* WorldContextObject, UCourierRequestAsset* Request, const TMap<FString, FString>& Variables)

@@ -49,6 +49,7 @@ namespace CourierUI
 		{
 		case ECourierProtocol::WebSocket:			return TEXT("WS");
 		case ECourierProtocol::ServerSentEvents:	return TEXT("SSE");
+		case ECourierProtocol::SocketIO:			return TEXT("SIO");
 		default:
 			if (Spec.BodyType == ECourierBodyType::GraphQL)
 			{
@@ -64,6 +65,7 @@ namespace CourierUI
 		{
 		case ECourierProtocol::WebSocket:			return FLinearColor(0.30f, 0.85f, 0.85f);
 		case ECourierProtocol::ServerSentEvents:	return FLinearColor(0.95f, 0.55f, 0.85f);
+		case ECourierProtocol::SocketIO:			return FLinearColor(0.55f, 0.75f, 1.00f);
 		default:
 			return Spec.BodyType == ECourierBodyType::GraphQL ? FSlateColor(FLinearColor(0.90f, 0.40f, 0.70f)) : VerbColor(Spec.Verb);
 		}

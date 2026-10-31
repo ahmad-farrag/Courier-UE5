@@ -27,4 +27,5 @@ private:
 	void RegisterMenus();
 
 	TWeakPtr<SCourierWindow> Window;
+	FDelegateHandle CookiesChangedHandle;
 };
