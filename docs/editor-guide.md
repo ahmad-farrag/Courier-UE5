@@ -8,8 +8,8 @@ The Courier window is a dockable editor tab. Open it from **Tools > Courier API 
 
 | Area | What it holds |
 |---|---|
-| Toolbar | **New** (HTTP, GraphQL, WebSocket, Server-Sent Events, Collection), **Import**, and the **Environment** combo (with **Manage environments...**) |
-| Sidebar | Three tabs: **Collections**, **Environments**, **History** |
+| Toolbar | **New** (HTTP, GraphQL, WebSocket, Server-Sent Events, Socket.IO, Collection), **Import**, and the **Environment** combo (with **Manage environments...**) |
+| Sidebar | Four tabs: **Collections**, **Environments**, **History**, **Cookies** |
 | Request editor | Name, protocol, **Save**, **More**; method and URL with **Send** / **Connect**; the resolved URL preview; tabs **Params**, **Headers**, **Body**, **Auth**, **Settings** |
 | Bottom pane | **Response** for HTTP and GraphQL, or the **Events** / **Messages** console for streams |
 
@@ -36,11 +36,22 @@ If a `{{variable}}` has no value, the editor shows **not set: name** under the U
 
 ## Auth tab
 
-Bearer token, Basic (username and password), or API key (key and value, sent as a header or, with **Send in the query string instead of a header**, as a query parameter). Every field accepts variables, so tokens normally live in an environment: `Bearer {{token}}`.
+Bearer token, Basic (username and password), API key (key and value, sent as a header or, with **Send in the query string instead of a header**, as a query parameter), or OAuth 2.0. Every field accepts variables, so secrets normally live in an environment: `{{clientSecret}}`.
+
+### OAuth 2.0
+
+![OAuth 2.0 panel](images/oauth2-panel.png)
+
+1. Pick the **Grant type**: Client Credentials (machine to machine), Password Credentials, or Authorization Code (a user signs in through the browser).
+2. Fill **Access token URL**, **Client ID** and **Client secret**; for Authorization Code also **Auth URL** and **Redirect URI**. The redirect URI must be a loopback address (`http://127.0.0.1:8976/callback` by default) registered with the provider: Courier listens on that port during sign-in.
+3. Optional: **Scope**, **Audience**, **Client authentication** (Basic header or body), **Use PKCE**, **Header prefix**, or a fixed **Access token**.
+4. Press **Send**. Without a token, Courier gets one first (Authorization Code opens your browser; the page says "Signed in" when Courier has the code). **Get New Access Token** does the same without sending the request; **Clear Tokens** forgets every cached token.
+
+The status line shows the cached token (shortened), how long it is valid, and whether a refresh token is kept. Expired tokens are refreshed automatically on the next send.
 
 ## Settings tab
 
-**Timeout** in seconds (0 uses the engine default) and, for WebSocket requests, **Sub-protocols** as a comma separated list.
+**Timeout** in seconds (0 uses the engine default), **Send and store cookies**, and per protocol: **Sub-protocols** for WebSocket, **Namespace** and **Auth payload** (JSON sent with the Socket.IO CONNECT packet; the server reads it as `socket.handshake.auth`) for Socket.IO.
 
 ## Response pane
 
@@ -57,13 +68,29 @@ Pick the protocol from the combo next to the name, or create the request from **
 * WebSocket requests get a message box under the log. **Ctrl+Enter** in the box sends it, and `{{variables}}` in the message are filled.
 * Binary WebSocket messages are shown as hex. **Clear** empties the log.
 
+## Socket.IO
+
+Create a request with **New > Socket.IO** (badge `SIO`). The URL is the server address; Courier adds `/socket.io/?EIO=4&transport=websocket`. Set the namespace and auth payload in **Settings**, then **Connect**.
+
+![Socket.IO console](images/socketio-live.gif)
+
+* The log shows the connection, then every event: the event name in pink, its arguments as a JSON array.
+* To emit, type the event name in the small box and the data in the large one (JSON is sent as is, other text as a string), then **Emit** or **Ctrl+Enter**. Tick **Ack** to request an acknowledgement; the reply appears as `ack #<id>`.
+* A refused namespace shows the server's error ("Connect error: unauthorized ..."). **Disconnect** sends a proper Socket.IO disconnect.
+
+## Cookies
+
+![Cookie jar](images/cookie-jar.png)
+
+The **Cookies** tab lists every cookie in the jar with its domain (a leading dot means subdomains too), path, expiry and flags. Delete one with its ✕, or **Clear All**. Requests send matching cookies and store new ones unless **Send and store cookies** is off in their Settings. The jar is saved in `Saved/Courier/Cookies.json`, so a login survives an editor restart.
+
 ## Collections
 
 Collections hold requests and folders (folders can nest: `Users/Admin`). Right-click in the tree for:
 
 | On | Commands |
 |---|---|
-| Collection | New HTTP Request, New WebSocket, New Server-Sent Events, New Folder, Rename, Export to Postman..., Delete |
+| Collection | New HTTP Request, New WebSocket, New Server-Sent Events, New Socket.IO, New Folder, Rename, Export to Postman..., Delete |
 | Folder | the same New commands, Rename, Delete |
 | Request | Duplicate, Move to Folder..., Rename, Copy as cURL, Delete |
 
@@ -102,4 +129,4 @@ When a request comes from an asset, the header shows **asset \<name\>**, and **S
 
 ## Where data lives
 
-The workspace (collections, environments, globals, history) is one JSON file per machine: `<Project>/Saved/Courier/Workspace.json`. It is not meant for source control. Share collections and environments by exporting them, or share requests as assets.
+The workspace (collections, environments, globals, history) is one JSON file per machine: `<Project>/Saved/Courier/Workspace.json`; cookies are in `Cookies.json` next to it; OAuth 2.0 tokens stay in memory only. It is not meant for source control. Share collections and environments by exporting them, or share requests as assets.

@@ -91,6 +91,68 @@ For functions, Blueprint function libraries and anywhere a latent node is not al
 | On Binary Message | Data (bytes; fragments joined first) |
 | On Message Sent | Message |
 
+## Socket.IO
+
+**Create Courier Socket IO** (`Url`, `Namespace`, `Auth Json`, `Headers`) or **Create Courier Socket IO From Request** (`Request`, `Variables`; URL, headers, auth, namespace and auth payload come from the request) return a `Courier Socket IO`. Keep it in a variable.
+
+`Url` is the server address (`https://example.com`); Courier connects to `wss://example.com/socket.io/?EIO=4&transport=websocket`. Give a path (`https://example.com/realtime/`) when the server uses a custom one. Works with Socket.IO v3 and v4 servers.
+
+| Function | |
+|---|---|
+| Connect, Disconnect | |
+| Emit | `Event Name`, `Data`: any JSON value is sent as one argument as is (`{"x":1}`, `42`, `true`); other text is sent as a string; empty sends no argument. False when not connected |
+| Emit With Ack | Same, and asks the server to acknowledge. Returns the ack id (-1 when not connected); **On Ack** fires with it |
+| Emit Args | `Args Json Array`: several arguments at once, e.g. `[1, "two", {"three": 3}]` |
+| Is Connected, Get Socket Id | |
+
+| Event | Parameters |
+|---|---|
+| On Connected | Socket Id |
+| On Connect Error | Message (the server's middleware error, e.g. "unauthorized", or a WebSocket error) |
+| On Disconnected | Reason (`io client disconnect`, `io server disconnect`, `transport close (...)`, `ping timeout`) |
+| On Event | Event Name, Args Json (a JSON array of the event's arguments: read them with `Get Json String` and paths like `[0].score`) |
+| On Ack | Ack Id, Args Json |
+
+Every parameter is a string or an int, so these events also work from Python. When the server asks for an acknowledgement of one of its events, Courier answers with no arguments.
+
+## OAuth 2.0
+
+Set a request's `Auth.Type` to **OAuth 2.0** and fill `Auth.OAuth2` (`Courier OAuth2`). Every send then makes sure a token exists: it uses the cached one, refreshes it with the refresh token when it is about to expire (30 seconds early), or runs the grant. On Failure fires with `Error` starting "OAuth 2.0:" when no token can be had.
+
+| Field | |
+|---|---|
+| Grant Type | Client Credentials, Password Credentials, Authorization Code |
+| Access Token Url, Auth Url | Auth Url is used by Authorization Code only |
+| Client Id, Client Secret | Leave the secret empty for public clients |
+| Scope, Audience | Space separated scopes; audience is sent when set |
+| Username, Password | Password grant only |
+| Redirect Uri | `http://127.0.0.1:<port>/<path>` or `http://localhost:...`; Courier listens there while the browser sign-in runs (5 minute limit) |
+| Use Pkce | S256 code challenge; on by default |
+| Client Authentication | Basic Auth header (default) or in the request body |
+| Header Prefix | Word before the token, `Bearer` by default |
+| Access Token | A token to use as is; empty lets Courier manage it |
+
+| Node / function | |
+|---|---|
+| **Get Courier OAuth2 Token** (async) | `Settings`, `Variables`, `Force New`. **On Success** / **On Failure** with a `Courier OAuth2 Token`: `Access Token`, `Token Type`, `Refresh Token`, `Id Token`, `Scope`, `Expires At` (UTC), `Error`, `Raw Response` |
+| Get Cached Courier OAuth2 Token | The cached token for these settings, valid or expired |
+| Clear Courier OAuth2 Tokens | Forget every cached token (sign-out) |
+
+Tokens are cached in memory for the running process. Authorization Code opens the system browser, so use it in the editor and on desktop; servers and headless games use Client Credentials.
+
+## Cookies
+
+Every request sends matching cookies and stores the ones the server sets, unless its `Use Cookie Jar` is off. The jar is shared by the whole process.
+
+| Function | |
+|---|---|
+| Get Courier Cookies | Cookies that would be sent to `Url`; all cookies when `Url` is empty |
+| Get Courier Cookie Header | The `Cookie` header value for `Url` |
+| Set Courier Cookie | Add or replace a `Courier Cookie` (`Name`, `Value`, `Domain`, `Path`, `Expires`, `Secure`, `Http Only`, `Host Only`) |
+| Remove Courier Cookies | By domain, or one cookie by domain and name |
+| Clear Courier Cookies | |
+| Save Courier Cookies, Load Courier Cookies | To and from a JSON file, for example `Saved/Cookies.json`, to keep a session across launches |
+
 ## Server-Sent Events
 
 **Create Courier Event Source** (`Url`, `Headers`) or **Create Courier Event Source From Request** return a `Courier Event Source`. Keep it in a variable, as with WebSockets.
@@ -135,4 +197,4 @@ Import at run time lets a game read request definitions from a downloaded file, 
 
 ## Courier Request Spec
 
-The struct behind every request: `Name`, `Folder`, `Description`, `Protocol` (Http, WebSocket, ServerSentEvents), `Verb`, `Custom Verb`, `Url`, `Query Params`, `Headers`, `Body Type`, `Body`, `Raw Content Type`, `Form Fields`, `GraphQL Query`, `GraphQL Variables`, `Auth`, `Timeout Seconds`, `Web Socket Protocols`. Key / value rows have an `Enabled` flag; disabled rows are not sent.
+The struct behind every request: `Name`, `Folder`, `Description`, `Protocol` (Http, WebSocket, ServerSentEvents, SocketIO), `Verb`, `Custom Verb`, `Url`, `Query Params`, `Headers`, `Body Type`, `Body`, `Raw Content Type`, `Form Fields`, `GraphQL Query`, `GraphQL Variables`, `Auth` (including `OAuth2`), `Timeout Seconds`, `Web Socket Protocols`, `Use Cookie Jar`, `Socket IO Namespace`, `Socket IO Auth`. Key / value rows have an `Enabled` flag; disabled rows are not sent.
