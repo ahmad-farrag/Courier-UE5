@@ -64,16 +64,15 @@ Courier is one plugin with three modules. Nothing else to install: it uses the e
 
 ## Screenshots
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/images/blueprint-node.png" alt="Blueprint graph with a Courier: CR_PostScore node wired to Break Courier Response, Get Json String and Print String"></td>
-    <td width="50%"><img src="docs/images/editor-sse.png" alt="The Courier window connected to a Server-Sent Events stream, showing live events"></td>
-  </tr>
-  <tr>
-    <td><sub><b>Request asset as a Blueprint node.</b> <code>Courier: CR_PostScore</code> exposes <code>Base</code>, <code>Season</code> and <code>Player</code> because the request uses <code>{{base}}</code>, <code>{{season}}</code> and <code>{{player}}</code>. The response feeds <code>Get Json String</code> with the path <code>json.player</code>.</sub></td>
-    <td><sub><b>Streaming.</b> A Server-Sent Events request connected to Wikimedia's public recent-changes stream. WebSocket requests use the same console with a message composer.</sub></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/images/blueprint-node.png" alt="Blueprint graph with a Courier: CR_PostScore node wired to Break Courier Response, Get Json String and Print String" width="100%">
+  <br><sub><b>A request asset as a Blueprint node.</b> <code>Courier: CR_PostScore</code> has <b>Base</b>, <b>Season</b> and <b>Player</b> pins because the request uses <code>{{base}}</code>, <code>{{season}}</code> and <code>{{player}}</code>. On Success, the response body goes through <code>Get Json String</code> with the path <code>json.player</code>.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/editor-sse.png" alt="The Courier window connected to a Server-Sent Events stream, showing live events" width="100%">
+  <br><sub><b>Streaming.</b> A Server-Sent Events request connected to Wikimedia's public recent-changes stream. WebSocket requests use the same console, with a message box for sending.</sub>
+</p>
 
 ## Quick start
 
@@ -174,31 +173,31 @@ Collections with nested folders, rename / duplicate / move / delete, a filter bo
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Editor["CourierEditor (Editor)"]
-        W["Courier window<br/>collections, environments, history"]
-        F["Request asset factory<br/>+ asset definition"]
+flowchart TB
+    subgraph Editor["CourierEditor · Editor"]
+        W["Courier window"]
+        F["Request asset factory"]
     end
-    subgraph BP["CourierBlueprint (UncookedOnly)"]
-        K["K2Node_CourierRequest<br/>'Courier: &lt;asset&gt;'"]
+    subgraph BP["CourierBlueprint · UncookedOnly"]
+        K["Courier: (asset name) node"]
     end
-    subgraph RT["Courier (Runtime)"]
-        A["UCourierRequestAsset"]
-        S["UCourierSendRequest<br/>async node + delegates"]
-        H["FCourierHttp<br/>variables, auth, bodies, cURL"]
-        WS["UCourierWebSocket"]
-        ES["UCourierEventSource<br/>+ SSE parser"]
-        P["FCourierPostman"]
-        J["UCourierLibrary<br/>JSON helpers"]
+    subgraph RT["Courier · Runtime (ships in games)"]
+        S["Async nodes and callbacks"]
+        H["FCourierHttp: variables, auth, bodies"]
+        WS["WebSocket"]
+        ES["Event Source (SSE)"]
+        P["Postman import / export"]
     end
-    W --> H & WS & ES & P
-    F --> A
-    K -- "expands at compile time to" --> S
+    W --> H
+    W --> WS
+    W --> ES
+    W --> P
+    F --> S
+    K -- "compiles to" --> S
     S --> H
-    A --> S
-    H --> HTTP[["Engine HTTP"]]
-    WS --> WSM[["Engine WebSockets"]]
-    ES --> HTTP
+    H --> E[["Engine HTTP and WebSockets modules"]]
+    WS --> E
+    ES --> E
 ```
 
 The node module is **UncookedOnly**: the node turns into plain function calls when the Blueprint compiles, so packaged games only load the runtime module. More in [docs/architecture.md](docs/architecture.md).
